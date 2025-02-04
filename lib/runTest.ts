@@ -4,11 +4,10 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as cp from 'child_process';
-import * as path from 'path';
-import { downloadAndUnzipVSCode, DownloadVersion, DownloadPlatform, defaultCachePath } from './download';
-import { ProgressReporter } from './progress';
+import { DownloadOptions, downloadAndUnzipVSCode } from './download';
+import { getProfileArguments, killTree } from './util';
 
-export interface TestOptions {
+export interface TestOptions extends Partial<DownloadOptions> {
 	/**
 	 * The VS Code executable path used for testing.
 	 *
@@ -16,34 +15,6 @@ export interface TestOptions {
 	 * If `version` is not specified either, will download and use latest stable release.
 	 */
 	vscodeExecutablePath?: string;
-
-	/**
-	 * The VS Code version to download. Valid versions are:
-	 * - `'stable'`
-	 * - `'insiders'`
-	 * - `'1.32.0'`, `'1.31.1'`, etc
-	 *
-	 * Defaults to `stable`, which is latest stable version.
-	 *
-	 * *If a local copy exists at `.vscode-test/vscode-<VERSION>`, skip download.*
-	 */
-	version?: DownloadVersion;
-
-	/**
-	 * The VS Code platform to download. If not specified, it defaults to the
-	 * current platform.
-	 *
-	 * Possible values are:
-	 * 	- `win32-archive`
-	 * 	- `win32-x64-archive`
-	 * 	- `win32-arm64-archive		`
-	 * 	- `darwin`
-	 * 	- `darwin-arm64`
-	 * 	- `linux-x64`
-	 * 	- `linux-arm64`
-	 * 	- `linux-armhf`
-	 */
-	platform?: DownloadPlatform;
 
 	/**
 	 * Whether VS Code should be launched using default settings and extensions
@@ -72,6 +43,8 @@ export interface TestOptions {
 	 * When running the extension test, the Extension Development Host will call this function
 	 * that runs the test suite. This function should throws an error if any test fails.
 	 *
+	 * The first argument is the path to the file specified in `extensionTestsPath`.
+	 *
 	 */
 	extensionTestsPath: string;
 
@@ -93,19 +66,6 @@ export interface TestOptions {
 	 * See `code --help` for possible arguments.
 	 */
 	launchArgs?: string[];
-
-	/**
-	 * Progress reporter to use while VS Code is downloaded. Defaults to a
-	 * console reporter. A {@link SilentReporter} is also available, and you
-	 * may implement your own.
-	 */
-	reporter?: ProgressReporter;
-
-	/**
-	 * Whether the downloaded zip should be synchronously extracted. Should be
-	 * omitted unless you're experiencing issues installing VS Code versions.
-	 */
-	extractSync?: boolean;
 }
 
 /**
@@ -121,17 +81,18 @@ export async function runTests(options: TestOptions): Promise<number> {
 	let args = [
 		// https://github.com/microsoft/vscode/issues/84238
 		'--no-sandbox',
+		// https://github.com/microsoft/vscode-test/issues/221
+		'--disable-gpu-sandbox',
 		// https://github.com/microsoft/vscode-test/issues/120
 		'--disable-updates',
 		'--skip-welcome',
 		'--skip-release-notes',
 		'--disable-workspace-trust',
-		'--extensionTestsPath=' + options.extensionTestsPath
+		'--extensionTestsPath=' + options.extensionTestsPath,
 	];
 
 	if (Array.isArray(options.extensionDevelopmentPath)) {
-		args.push(...options.extensionDevelopmentPath.map(devPath =>
-			`--extensionDevelopmentPath=${devPath}`));
+		args.push(...options.extensionDevelopmentPath.map((devPath) => `--extensionDevelopmentPath=${devPath}`));
 	} else {
 		args.push(`--extensionDevelopmentPath=${options.extensionDevelopmentPath}`);
 	}
@@ -146,24 +107,7 @@ export async function runTests(options: TestOptions): Promise<number> {
 
 	return innerRunTests(options.vscodeExecutablePath, args, options.extensionTestsEnv);
 }
-
-/** Adds the extensions and user data dir to the arguments for the VS Code CLI */
-export function getProfileArguments(args: readonly string[]) {
-	const out: string[] = [];
-	if (!hasArg('extensions-dir', args)) {
-		out.push(`--extensions-dir=${path.join(defaultCachePath, 'extensions')}`)
-	}
-
-	if (!hasArg('user-data-dir', args)) {
-		out.push(`--user-data-dir=${path.join(defaultCachePath, 'user-data')}`)
-	}
-
-	return out;
-}
-
-function hasArg(argName: string, argList: readonly string[]) {
-	return argList.some(a => a === `--${argName}` || a.startsWith(`--${argName}=`));
-}
+const SIGINT = 'SIGINT';
 
 async function innerRunTests(
 	executable: string,
@@ -172,12 +116,33 @@ async function innerRunTests(
 		[key: string]: string | undefined;
 	}
 ): Promise<number> {
-	return new Promise<number>((resolve, reject) => {
-		const fullEnv = Object.assign({}, process.env, testRunnerEnv);
-		const cmd = cp.spawn(executable, args, { env: fullEnv });
+	const fullEnv = Object.assign({}, process.env, testRunnerEnv);
+	const shell = process.platform === 'win32';
+	const cmd = cp.spawn(shell ? `"${executable}"` : executable, args, { env: fullEnv, shell });
 
-		cmd.stdout.on('data', d => process.stdout.write(d));
-		cmd.stderr.on('data', d => process.stderr.write(d));
+	let exitRequested = false;
+	const ctrlc1 = () => {
+		process.removeListener(SIGINT, ctrlc1);
+		process.on(SIGINT, ctrlc2);
+		console.log('Closing VS Code gracefully. Press Ctrl+C to force close.');
+		exitRequested = true;
+		cmd.kill(SIGINT); // this should cause the returned promise to resolve
+	};
+
+	const ctrlc2 = () => {
+		console.log('Closing VS Code forcefully.');
+		process.removeListener(SIGINT, ctrlc2);
+		exitRequested = true;
+		killTree(cmd.pid!, true);
+	};
+
+	const prom = new Promise<number>((resolve, reject) => {
+		if (cmd.pid) {
+			process.on(SIGINT, ctrlc1);
+		}
+
+		cmd.stdout.on('data', (d) => process.stdout.write(d));
+		cmd.stderr.on('data', (d) => process.stderr.write(d));
 
 		cmd.on('error', function (data) {
 			console.log('Test error: ' + data.toString());
@@ -191,18 +156,40 @@ async function innerRunTests(
 			finished = true;
 			console.log(`Exit code:   ${code ?? signal}`);
 
-			if (code === null) {
-				reject(signal);
-			} else if (code !== 0) {
-				reject('Failed');
+			// fix: on windows, it seems like these descriptors can linger for an
+			// indeterminate amount of time, causing the process to hang.
+			cmd.stdout.destroy();
+			cmd.stderr.destroy();
+
+			if (code !== 0) {
+				reject(new TestRunFailedError(code ?? undefined, signal ?? undefined));
 			} else {
-				console.log('Done\n');
-				resolve(code ?? -1);
+				resolve(0);
 			}
 		}
 
 		cmd.on('close', onProcessClosed);
-
 		cmd.on('exit', onProcessClosed);
 	});
+
+	let code: number;
+	try {
+		code = await prom;
+	} finally {
+		process.removeListener(SIGINT, ctrlc1);
+		process.removeListener(SIGINT, ctrlc2);
+	}
+
+	// exit immediately if we handled a SIGINT and no one else did
+	if (exitRequested && process.listenerCount(SIGINT) === 0) {
+		process.exit(1);
+	}
+
+	return code;
+}
+
+export class TestRunFailedError extends Error {
+	constructor(public readonly code: number | undefined, public readonly signal: string | undefined) {
+		super(signal ? `Test run terminated with signal ${signal}` : `Test run failed with code ${code}`);
+	}
 }
